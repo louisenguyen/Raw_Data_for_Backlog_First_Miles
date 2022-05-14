@@ -1,0 +1,53 @@
+SELECT
+        order_milestones.order_id
+        ,order_milestones.tracking_id
+        ,transactions.status AS "pickup_status"
+        ,order_milestones.granular_status
+        ,DATE(order_milestones.creation_datetime) AS "creation_date"
+        ,shippers_enriched.shipper_name
+        ,regexp_replace(element_at(split(order_milestones.from_address1,','),-3),'tp.|thành phố ','') AS "pickup_address_lv1"
+        ,trim(regexp_replace(order_milestones.from_address2,',','')) AS "pickup_address_lv2"
+        ,regexp_replace(element_at(split(order_milestones.from_address1,','),-1),',','') "pickup_address_lv3"
+        ,IF(order_milestones.granular_status = 'Pending Pickup', c2.working_day_cum - c1.working_day_cum, null ) AS "pending_pickup_aging"
+        ,CASE 
+            WHEN transactions.status = 'Pending' THEN order_milestones.pickup_attempts
+            WHEN transactions.status = 'Success' AND IF(order_milestones.first_pickup_attempt_failure_reason_id is NULL, 'No', 'Yes') = 'No'  THEN NULL
+            WHEN transactions.status = 'Success' AND IF(order_milestones.first_pickup_attempt_failure_reason_id is NULL, 'No', 'Yes') = 'Yes' AND order_milestones.pickup_attempts = 1 THEN order_milestones.pickup_attempts
+            WHEN transactions.status = 'Success' AND IF(order_milestones.first_pickup_attempt_failure_reason_id is NULL, 'No', 'Yes') = 'Yes' AND order_milestones.pickup_attempts >= 2 THEN order_milestones.pickup_attempts - 1
+            ELSE order_milestones.pickup_attempts END AS "cnt_fail_attempts"
+        ,CASE 
+            WHEN (IF(order_milestones.first_pickup_attempt_failure_reason_id is NULL, 'No', 'Yes')) = 'Yes' and order_milestones.granular_status = 'Pending Pickup' THEN date_diff('hour',order_milestones.first_pickup_attempt_datetime, current_date)
+            WHEN (IF(order_milestones.first_pickup_attempt_failure_reason_id is NULL, 'No', 'Yes')) = 'Yes' and transactions.status = 'Success' THEN date_diff('hour',order_milestones.first_pickup_attempt_datetime, order_milestones.pickup_datetime)
+        ELSE NULL END AS "1st_pickup_failed_aging_hour"
+        ,IF(order_milestones.first_pickup_attempt_failure_reason_id is NULL, 'No', 'Yes') AS "first_pickup_failed"
+        ,CASE
+            WHEN order_milestones.first_pickup_attempt_failure_reason_id = 2555 THEN 'Địa chỉ hoặc số điện thoại không chính xác'
+            WHEN order_milestones.first_pickup_attempt_failure_reason_id = 2557 THEN 'Hàng hóa thuộc danh mục không nhận vận chuyển'
+            WHEN order_milestones.first_pickup_attempt_failure_reason_id = 2554 THEN 'Người gửi không nghe máy hoặc địa chỉ không có người gửi'
+            WHEN order_milestones.first_pickup_attempt_failure_reason_id = 2556 THEN 'Kiện hàng chưa đóng gói hoàn thiện'
+            WHEN order_milestones.first_pickup_attempt_failure_reason_id = 2551 THEN 'Không đủ thời gian để tài xế hoàn thành lộ trình'
+            WHEN order_milestones.first_pickup_attempt_failure_reason_id = 2559 THEN 'Không có kiện hàng'
+            WHEN order_milestones.first_pickup_attempt_failure_reason_id = 2550 THEN 'Shop hẹn ngày giờ lấy'
+        ELSE NULL END AS "first_pickup_attempt_failure_reason"
+        ,order_milestones.first_pickup_attempt_datetime
+    	    
+FROM vn_views.order_milestones
+
+JOIN vn_views.shippers_enriched ON order_milestones.legacy_shipper_id = shippers_enriched.legacy_id
+    AND shippers_enriched.shipper_group = 'Lazada Master Account (ASC)'
+    AND shippers_enriched.account_type_name not like 'Test'
+    
+JOIN vn_views.calendar c1 ON c1.date = date(order_milestones.creation_datetime)
+JOIN vn_views.calendar c2 ON c2.date = current_date
+
+LEFT JOIN datalake_core_prod_vn.transactions ON vn_views.order_milestones.order_id = datalake_core_prod_vn.transactions.order_id AND transactions.seq_no = 1
+
+LEFT JOIN datalake_core_prod_vn.transaction_failure_reason ON datalake_core_prod_vn.transaction_failure_reason."transaction_id" = datalake_core_prod_vn.transactions."id"
+LEFT JOIN datalake_driver_prod_gl.failure_reasons ON datalake_driver_prod_gl.failure_reasons."id" = datalake_core_prod_vn.transaction_failure_reason."failure_reason_id" 
+  AND datalake_driver_prod_gl.failure_reasons."system_id" = 'vn' 
+  AND datalake_driver_prod_gl.failure_reasons."mode" = 'pickup'
+
+WHERE TRUE
+    AND order_milestones.granular_status != 'Cancelled'
+    AND order_milestones.is_pickup_required = 1
+    AND order_milestones.granular_status = 'Pending Pickup'
